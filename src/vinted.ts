@@ -4,8 +4,6 @@ import { errorResult, McpServer, ToolInfo } from "./mcp";
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36";
 const MAX_IMAGES = 4;
-/** Anonymous Vinted sessions stay valid for a while; renewing every 20 minutes keeps us well inside that. */
-const SESSION_TTL_MS = 20 * 60_000;
 
 const HOSTS: Record<string, string> = {
   de: "www.vinted.de",
@@ -38,7 +36,11 @@ const CONDITIONS: Record<string, number> = {
 
 type Content = { type: "text"; text: string } | { type: "image"; data: string; mimeType: string };
 
-const sessions = new Map<string, { cookie: string; expires: number }>();
+const HTML_HEADERS = {
+  "User-Agent": UA,
+  Accept: "text/html,application/xhtml+xml",
+  "Accept-Language": "de-DE,de;q=0.9",
+};
 
 function hostFor(country: string | undefined): string {
   const key = (country ?? "de").toLowerCase().replace(/^\./, "");
@@ -48,61 +50,28 @@ function hostFor(country: string | undefined): string {
 }
 
 /**
- * The JSON API only answers with the cookies the start page hands out to anonymous visitors
- * (access_token_web and friends). They are cached per host for the lifetime of the isolate.
+ * Vinted's JSON catalogue picks the market from the caller's IP, and Cloudflare's egress IPs count as US.
+ * The server-rendered pages on www.vinted.<tld> always show that country's market, so they are the source.
  */
-async function session(host: string, renew = false): Promise<string> {
-  const cached = sessions.get(host);
-  if (cached && !renew && cached.expires > Date.now()) return cached.cookie;
-  const res = await fetch(`https://${host}/`, {
-    headers: { "User-Agent": UA, Accept: "text/html,application/xhtml+xml", "Accept-Language": "de-DE,de;q=0.9" },
-  });
+async function page(url: string): Promise<Response> {
+  const res = await fetch(url, { headers: HTML_HEADERS });
   if (res.status === 403 || res.status === 429) {
-    throw new Error(`Vinted blockiert die Anfrage gerade (HTTP ${res.status} auf der Startseite, vermutlich Bot-Schutz).`);
+    throw new Error(`Vinted blockiert die Anfrage gerade (HTTP ${res.status}). Später erneut versuchen.`);
   }
-  // Workers keep each Set-Cookie header separate only through getAll.
-  const cookies = res.headers
-    .getAll("Set-Cookie")
-    .map((c) => c.split(";")[0].trim())
-    .filter((c) => c.includes("=") && !c.endsWith("="));
-  if (!cookies.some((c) => c.startsWith("access_token_web="))) {
-    throw new Error(`Vinted hat keine Sitzung ausgegeben (HTTP ${res.status}). Vermutlich greift der Bot-Schutz.`);
-  }
-  const cookie = cookies.join("; ");
-  sessions.set(host, { cookie, expires: Date.now() + SESSION_TTL_MS });
-  return cookie;
-}
-
-async function api(host: string, path: string): Promise<any> {
-  for (const renew of [false, true]) {
-    const res = await fetch(`https://${host}${path}`, {
-      headers: {
-        "User-Agent": UA,
-        Accept: "application/json, text/plain, */*",
-        "Accept-Language": "de-DE,de;q=0.9",
-        Referer: `https://${host}/`,
-        Cookie: await session(host, renew),
-      },
-    });
-    // An expired or rejected session comes back as 401; one fresh session is worth a retry.
-    if (res.status === 401 && !renew) continue;
-    if (res.status === 403 || res.status === 429) {
-      throw new Error(`Vinted blockiert die Anfrage gerade (HTTP ${res.status}). Später erneut versuchen.`);
-    }
-    if (!res.ok) {
-      // A short excerpt tells a moved endpoint (JSON error) apart from a bot wall (HTML page).
-      const body = clean((await res.text()).slice(0, 300));
-      const type = res.headers.get("Content-Type") ?? "?";
-      throw Object.assign(new Error(`Vinted antwortete mit HTTP ${res.status} für ${path} (${type}): ${body}`), {
-        status: res.status,
-      });
-    }
-    return res.json();
-  }
-  throw new Error("Vinted lehnt die Sitzung ab (HTTP 401).");
+  return res;
 }
 
 const clean = (s: unknown) => String(s ?? "").replace(/\s+/g, " ").trim();
+
+function decodeEntities(s: string): string {
+  return s
+    .replace(/&quot;/g, '"')
+    .replace(/&#x27;|&#39;|&apos;/g, "'")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&#(\d+);/g, (_, n) => String.fromCodePoint(Number(n)))
+    .replace(/&amp;/g, "&");
+}
 
 /** Prices show up either as {amount, currency_code} or as a plain string next to a currency field. */
 function money(value: any, currency?: string): string {
@@ -138,38 +107,74 @@ function searchParams(a: SearchArgs): URLSearchParams {
   return p;
 }
 
-function formatItem(it: any, host: string): string {
-  const price = money(it.price, it.currency);
-  const total = money(it.total_item_price, it.currency);
-  const priceText = total && total !== price ? `${price} (${total} mit Käuferschutz)` : price;
-  const facts = [it.brand_title, it.size_title, it.status].map(clean).filter(Boolean);
-  const favs = Number(it.favourite_count) > 0 ? `${it.favourite_count} ♥` : "";
-  const seller = it.user?.login ? `von ${it.user.login}` : "";
-  const url = it.url ? (String(it.url).startsWith("http") ? it.url : `https://${host}${it.url}`) : `https://${host}/items/${it.id}`;
-  return [
-    `- **${clean(it.title)}**${priceText ? ` · ${priceText}` : ""}`,
-    `  ${[...facts, favs, seller].filter(Boolean).join(" · ")}`,
-    `  ${url}`,
-  ]
-    .filter((l) => l.trim())
+interface CatalogItem {
+  id: string;
+  url: string;
+  title: string;
+  attrs: string[];
+  price: string;
+  total: string;
+}
+
+const PRICE_RE = /^\d[\d.,\s]*\s?(€|EUR|£|zł|Kč|kr|Ft|lei|RON|SEK|DKK|PLN|CZK|HUF|\$)$/;
+
+/**
+ * Each result tile has an overlay link whose title reads
+ * "<Titel>, Marke: woom, Zustand: Gut, Größe: M, 20.00 €, 21.70 €" (labels in the site's language).
+ */
+export function parseCatalog(html: string, host: string): CatalogItem[] {
+  const seen = new Set<string>();
+  const items: CatalogItem[] = [];
+  for (const m of html.matchAll(/<a\s[^>]*data-testid="product-item-id-(\d+)--overlay-link"[^>]*>/g)) {
+    const id = m[1];
+    if (seen.has(id)) continue;
+    seen.add(id);
+    const tag = m[0];
+    const href = tag.match(/href="([^"]+)"/)?.[1] ?? `/items/${id}`;
+    const parts = decodeEntities(tag.match(/title="([^"]*)"/)?.[1] ?? "").split(", ");
+    const prices: string[] = [];
+    while (parts.length > 1 && PRICE_RE.test(parts[parts.length - 1].trim())) prices.unshift(parts.pop()!.trim());
+    const attrs: string[] = [];
+    while (parts.length > 1 && /^[^:]{2,25}: \S/.test(parts[parts.length - 1])) attrs.unshift(parts.pop()!);
+    const fmt = (p?: string) => (p ? p.replace(/(\d)\.(\d{2})\b/, "$1,$2") : "");
+    items.push({
+      id,
+      url: `https://${host}${decodeEntities(href).split("?")[0]}`,
+      title: clean(parts.join(", ")),
+      attrs,
+      price: fmt(prices[0]),
+      total: fmt(prices[1]),
+    });
+  }
+  return items;
+}
+
+function formatItem(it: CatalogItem): string {
+  const price = it.total && it.total !== it.price ? `${it.price} (${it.total} mit Käuferschutz)` : it.price;
+  return [`- **${it.title}**${price ? ` · ${price}` : ""}`, it.attrs.length ? `  ${it.attrs.join(" · ")}` : "", `  ${it.url}`]
+    .filter(Boolean)
     .join("\n");
 }
 
 async function search(a: SearchArgs): Promise<Content[]> {
   if (!a.query?.trim()) return [{ type: "text", text: "Bitte einen Suchbegriff angeben." }];
   const host = hostFor(a.country);
-  const page = Math.max(1, a.page ?? 1);
+  const pageNo = Math.max(1, a.page ?? 1);
   const perPage = Math.min(96, Math.max(1, a.per_page ?? 24));
   const params = searchParams(a);
   const browserUrl = `https://${host}/catalog?${params}`;
-  params.set("page", String(page));
-  params.set("per_page", String(perPage));
-  const data = await api(host, `/api/v2/catalog/items?${params}`);
-  const items: any[] = data.items ?? [];
+  if (pageNo > 1) params.set("page", String(pageNo));
+  const res = await page(`https://${host}/catalog?${params}`);
+  if (!res.ok) throw new Error(`Vinted antwortete mit HTTP ${res.status} auf die Katalogsuche.`);
+  const html = await res.text();
+  const items = parseCatalog(html, host);
   if (!items.length) return [{ type: "text", text: `Keine Artikel für „${a.query}“ auf ${host} gefunden.\n${browserUrl}` }];
-  const total = data.pagination?.total_entries;
-  const head = `${total ? `${total} Treffer` : `${items.length} Treffer auf dieser Seite`} für „${a.query}“ auf ${host}, Seite ${page}.`;
-  return [{ type: "text", text: `${head}\nSuche im Browser: ${browserUrl}\n\n${items.map((it) => formatItem(it, host)).join("\n\n")}` }];
+  const total = html.match(/total_entries\\?"\s*:\s*(\d+)/)?.[1];
+  const shown = items.slice(0, perPage);
+  const head = `${total ? `${total} Treffer` : `${items.length} Treffer auf dieser Seite`} für „${a.query}“ auf ${host}, Seite ${pageNo}${
+    shown.length < items.length ? ` (die ersten ${shown.length} von ${items.length} dieser Seite)` : ""
+  }.`;
+  return [{ type: "text", text: `${head}\nSuche im Browser: ${browserUrl}\n\n${shown.map(formatItem).join("\n\n")}` }];
 }
 
 function parseItemRef(input: string, country?: string): { host: string; id: string } {
@@ -189,55 +194,9 @@ interface ItemDetails {
   photos: string[];
 }
 
-function fromApi(it: any, host: string): ItemDetails {
-  const state = it.is_closed ? "Verkauft: " : it.is_reserved ? "Reserviert: " : it.is_hidden ? "Verborgen: " : "";
-  const user = it.user ?? {};
-  const rating =
-    user.feedback_reputation !== undefined
-      ? `${(Number(user.feedback_reputation) * 5).toFixed(1).replace(".", ",")}/5 aus ${user.feedback_count ?? "?"} Bewertungen`
-      : "";
-  const place = [user.city ?? it.city, user.country_title ?? it.country].map(clean).filter(Boolean).join(", ");
-  const created = it.created_at_ts ? new Date(it.created_at_ts).toLocaleDateString("de-DE") : "";
-  const price = money(it.price, it.currency);
-  const total = money(it.total_item_price, it.currency);
-  const details = [
-    ["Marke", it.brand_dto?.title ?? it.brand],
-    ["Größe", it.size_title ?? it.size],
-    ["Zustand", it.status],
-    ["Farbe", [it.color1, it.color2].filter(Boolean).join(", ")],
-    ["Material", it.material?.title ?? it.material],
-    ["Paketgröße", it.package_size?.title],
-  ]
-    .filter(([, v]) => clean(v))
-    .map(([k, v]) => `${k}: ${clean(v)}`);
-  const url = it.url ? (String(it.url).startsWith("http") ? it.url : `https://${host}${it.url}`) : `https://${host}/items/${it.id}`;
-  const photos: string[] = (it.photos ?? []).map((p: any) => p.full_size_url ?? p.url).filter(Boolean);
-  return {
-    photos,
-    lines: [
-      `# ${state}${clean(it.title)}`,
-      `Preis: ${price || "keine Angabe"}${total && total !== price ? ` (${total} mit Käuferschutz)` : ""}`,
-      user.login ? `Verkäufer: ${user.login}${rating ? ` (${rating})` : ""}` : "",
-      place ? `Ort: ${place}` : "",
-      created ? `Eingestellt: ${created}` : "",
-      [it.favourite_count !== undefined ? `${it.favourite_count} Favoriten` : "", it.view_count !== undefined ? `${it.view_count} Aufrufe` : ""]
-        .filter(Boolean)
-        .join(" · "),
-      details.length ? `\n## Details\n${details.join("\n")}` : "",
-      `\n## Beschreibung\n${String(it.description ?? "").trim() || "keine"}`,
-      `\n${photos.length} Bilder · ${url}`,
-    ],
-  };
-}
-
-/** Fallback when the item API refuses: the product page carries JSON-LD and Open Graph tags. */
+/** The product page carries JSON-LD and Open Graph tags; the item API is gone since autumn 2026. */
 async function fromPage(host: string, id: string): Promise<ItemDetails | null> {
-  const res = await fetch(`https://${host}/items/${id}`, {
-    headers: { "User-Agent": UA, Accept: "text/html", "Accept-Language": "de-DE,de;q=0.9", Cookie: await session(host) },
-  });
-  if (res.status === 403 || res.status === 429) {
-    throw new Error(`Vinted blockiert die Anfrage gerade (HTTP ${res.status}). Später erneut versuchen.`);
-  }
+  const res = await page(`https://${host}/items/${id}`);
   if (!res.ok) return null;
   const root = parse(await res.text());
   const meta = (p: string) => root.querySelector(`meta[property="${p}"]`)?.getAttribute("content") ?? "";
@@ -264,7 +223,7 @@ async function fromPage(host: string, id: string): Promise<ItemDetails | null> {
       product?.brand?.name ? `Marke: ${clean(product.brand.name)}` : "",
       offer?.itemCondition ? `Zustand: ${clean(String(offer.itemCondition).split("/").pop())}` : "",
       `\n## Beschreibung\n${clean(product?.description ?? meta("og:description")) || "keine"}`,
-      `\n(Details aus der Artikelseite, die Vinted-API hat den Artikel nicht geliefert.) https://${host}/items/${id}`,
+      `\nhttps://${host}/items/${id}`,
     ],
   };
 }
@@ -277,15 +236,7 @@ function toBase64(buf: Uint8Array): string {
 
 async function getItem(input: string, country: string | undefined, withImages: boolean): Promise<Content[]> {
   const { host, id } = parseItemRef(input, country);
-  let details: ItemDetails | null = null;
-  try {
-    const data = await api(host, `/api/v2/items/${id}`);
-    if (data?.item) details = fromApi(data.item, host);
-  } catch (e) {
-    // Blocks are reported as-is; any other API refusal falls back to the HTML page.
-    if (/blockiert/.test((e as Error).message)) throw e;
-  }
-  details ??= await fromPage(host, id);
+  const details = await fromPage(host, id);
   if (!details) return [{ type: "text", text: `Artikel ${id} auf ${host} nicht gefunden (gelöscht oder verkauft?).` }];
 
   const content: Content[] = [{ type: "text", text: details.lines.filter((l) => l.trim()).join("\n") }];
@@ -312,7 +263,7 @@ const TOOLS: ToolInfo[] = [
     name: "search_items",
     title: "Vinted durchsuchen",
     description:
-      "Sucht Artikel auf Vinted und liefert je Treffer Titel, Preis (auch inkl. Käuferschutz), Marke, Größe, Zustand, Favoriten, Verkäufer und Link.",
+      "Sucht Artikel auf Vinted und liefert je Treffer Titel, Preis (auch inkl. Käuferschutz), Marke, Zustand, Größe und Link (bis 96 pro Seite).",
     inputSchema: {
       type: "object",
       properties: {
@@ -340,7 +291,7 @@ const TOOLS: ToolInfo[] = [
     name: "get_item",
     title: "Vinted-Artikel anzeigen",
     description:
-      "Liest einen einzelnen Vinted-Artikel: Preis, Verkäufer mit Bewertung, Ort, Details wie Marke, Größe, Zustand und Material, Beschreibung und optional die ersten Fotos.",
+      "Liest einen einzelnen Vinted-Artikel: Titel, Preis, Marke, Zustand, Beschreibung und optional die ersten Fotos.",
     inputSchema: {
       type: "object",
       properties: {
@@ -354,7 +305,7 @@ const TOOLS: ToolInfo[] = [
 ];
 
 export const vintedServer: McpServer = {
-  info: { name: "vinted", title: "Vinted", version: "0.1.0" },
+  info: { name: "vinted", title: "Vinted", version: "0.2.0" },
   instructions:
     "Lesender Zugriff auf Vinted ohne Login, Standard ist vinted.de. search_items für Suchen (Preisgrenzen, Zustand, " +
     "Sortierung), get_item für Details und Fotos eines Artikels. Immer den Link zum Artikel mitgeben. " +

@@ -8,12 +8,14 @@ Aufgebaut wie der Kleinanzeigen-Connector (`xuller4000/kleinanzeigen`), mit eige
 
 | Tool | Zweck |
 |---|---|
-| `search_items` | Suche mit Begriff, Preisgrenzen, Zustand, Sortierung, Seite und Länderseite (Standard vinted.de) |
-| `get_item` | Details eines Artikels: Preis mit Käuferschutz, Verkäufer und Bewertung, Ort, Marke, Größe, Zustand, Material, Beschreibung und die ersten vier Fotos |
+| `search_items` | Suche mit Begriff, Preisgrenzen, Zustand, Sortierung, Seite und Länderseite (Standard vinted.de). Je Treffer Titel, Preis mit Käuferschutz, Marke, Zustand, Größe und Link |
+| `get_item` | Details eines Artikels: Titel, Preis, Marke, Zustand, Beschreibung und die ersten vier Fotos |
 
 ## So funktioniert der Zugriff
 
-Vinted hat keine offizielle API. Der Worker ruft einmal die Startseite auf, nimmt die anonymen Session-Cookies (`access_token_web` usw.) mit und fragt damit dieselbe JSON-API ab, die auch die Website nutzt (`/api/v2/catalog/items`, `/api/v2/items/<id>`). Die Session wird pro Worker-Instanz 20 Minuten gehalten; bei HTTP 401 holt er einmal eine neue. Liefert die Artikel-API nichts, liest `get_item` die Artikelseite (JSON-LD und Open-Graph-Tags) als Ersatz.
+Vinted hat keine offizielle API. Seit Herbst 2026 gibt es die alten Endpunkte `/api/v2/catalog/items` und `/api/v2/items/<id>` nicht mehr. Die neue Katalog-API auf `api.vinted.<tld>/svc-catalogue/items` wählt den Markt nach der IP des Aufrufers, und Cloudflares Ausgangs-IPs gelten als USA. Von einem Worker aus kämen dort also US-Angebote in USD.
+
+Der Connector liest deshalb die normalen, serverseitig gerenderten Seiten von `www.vinted.<tld>`. Die zeigen immer den Markt der Domain. Bei der Suche ist das die Katalogseite, wo Titel, Marke, Zustand, Größe und Preise im Link-Titel jeder Kachel stehen. Bei einem Artikel ist es die Artikelseite mit JSON-LD und Open-Graph-Tags. Verkäufer, Favoriten und Bewertungen stehen dort nicht mehr drin.
 
 ## Einrichtung
 
