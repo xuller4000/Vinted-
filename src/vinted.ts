@@ -89,7 +89,14 @@ async function api(host: string, path: string): Promise<any> {
     if (res.status === 403 || res.status === 429) {
       throw new Error(`Vinted blockiert die Anfrage gerade (HTTP ${res.status}). Später erneut versuchen.`);
     }
-    if (!res.ok) throw Object.assign(new Error(`Vinted antwortete mit HTTP ${res.status} für ${path}.`), { status: res.status });
+    if (!res.ok) {
+      // A short excerpt tells a moved endpoint (JSON error) apart from a bot wall (HTML page).
+      const body = clean((await res.text()).slice(0, 300));
+      const type = res.headers.get("Content-Type") ?? "?";
+      throw Object.assign(new Error(`Vinted antwortete mit HTTP ${res.status} für ${path} (${type}): ${body}`), {
+        status: res.status,
+      });
+    }
     return res.json();
   }
   throw new Error("Vinted lehnt die Sitzung ab (HTTP 401).");
