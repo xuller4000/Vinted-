@@ -1,8 +1,10 @@
+import { useCache } from "./cache";
 import { handleMcp } from "./mcp";
 import { vintedServer } from "./vinted";
 
 export interface Env {
   CONNECTOR_SECRET: string;
+  CACHE?: KVNamespace;
 }
 
 function safeEqual(a: string, b: string): boolean {
@@ -28,6 +30,7 @@ export default {
         headers: { "Content-Type": "text/plain; charset=utf-8" },
       });
     }
+    useCache(env.CACHE);
     return handleMcp(req, vintedServer);
   },
 } satisfies ExportedHandler<Env>;

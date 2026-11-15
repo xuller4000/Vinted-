@@ -4,5 +4,7 @@
   "main": "src/index.ts",
   "compatibility_date": "2025-09-01",
   "workers_dev": true,
-  "observability": { "enabled": true }
+  "observability": { "enabled": true },
+  // Result cache, so repeated lookups do not count against Vinted's rate limit.
+  "kv_namespaces": [{ "binding": "CACHE", "id": "8b2ec908e0fa4695bcb1863d547d75d0" }]
 }

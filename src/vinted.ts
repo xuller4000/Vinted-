@@ -1,4 +1,5 @@
 import { parse } from "node-html-parser";
+import { BlockedError, cached } from "./cache";
 import { errorResult, McpServer, ToolInfo } from "./mcp";
 
 const UA =
@@ -54,12 +55,22 @@ function hostFor(country: string | undefined): string {
  * The server-rendered pages on www.vinted.<tld> always show that country's market, so they are the source.
  */
 async function page(url: string): Promise<Response> {
-  const res = await fetch(url, { headers: HTML_HEADERS });
-  if (res.status === 403 || res.status === 429) {
-    throw new Error(`Vinted blockiert die Anfrage gerade (HTTP ${res.status}). Später erneut versuchen.`);
+  for (let attempt = 0; ; attempt++) {
+    const res = await fetch(url, { headers: HTML_HEADERS });
+    if (res.status !== 403 && res.status !== 429) return res;
+    // Honour a short Retry-After once; anything longer goes back to the caller instead of hammering.
+    const wait = Number(res.headers.get("Retry-After"));
+    if (attempt > 0 || res.status !== 429 || !(wait > 0 && wait <= 3)) throw new BlockedError(res.status);
+    await new Promise((r) => setTimeout(r, wait * 1000));
   }
-  return res;
 }
+
+/** Search results stay fresh for 15 minutes, item pages for an hour. */
+const SEARCH_FRESH_MS = 15 * 60_000;
+const ITEM_FRESH_MS = 60 * 60_000;
+
+const staleNote = (minutes?: number) =>
+  minutes === undefined ? "" : `Hinweis: Vinted drosselt gerade, das ist der Stand von vor ${minutes} Minuten.\n\n`;
 
 const clean = (s: unknown) => String(s ?? "").replace(/\s+/g, " ").trim();
 
@@ -164,17 +175,22 @@ async function search(a: SearchArgs): Promise<Content[]> {
   const params = searchParams(a);
   const browserUrl = `https://${host}/catalog?${params}`;
   if (pageNo > 1) params.set("page", String(pageNo));
-  const res = await page(`https://${host}/catalog?${params}`);
-  if (!res.ok) throw new Error(`Vinted antwortete mit HTTP ${res.status} auf die Katalogsuche.`);
-  const html = await res.text();
-  const items = parseCatalog(html, host);
-  if (!items.length) return [{ type: "text", text: `Keine Artikel für „${a.query}“ auf ${host} gefunden.\n${browserUrl}` }];
-  const total = html.match(/total_entries\\?"\s*:\s*(\d+)/)?.[1];
+  const url = `https://${host}/catalog?${params}`;
+  // per_page is applied after the cache, so the same search with a different page size costs nothing.
+  const { value, staleMinutes } = await cached(`s:${url}`, SEARCH_FRESH_MS, async () => {
+    const res = await page(url);
+    if (!res.ok) throw new Error(`Vinted antwortete mit HTTP ${res.status} auf die Katalogsuche.`);
+    const html = await res.text();
+    return { items: parseCatalog(html, host), total: html.match(/total_entries\\?"\s*:\s*(\d+)/)?.[1] };
+  });
+  const { items, total } = value;
+  const note = staleNote(staleMinutes);
+  if (!items.length) return [{ type: "text", text: `${note}Keine Artikel für „${a.query}“ auf ${host} gefunden.\n${browserUrl}` }];
   const shown = items.slice(0, perPage);
   const head = `${total ? `${total} Treffer` : `${items.length} Treffer auf dieser Seite`} für „${a.query}“ auf ${host}, Seite ${pageNo}${
     shown.length < items.length ? ` (die ersten ${shown.length} von ${items.length} dieser Seite)` : ""
   }.`;
-  return [{ type: "text", text: `${head}\nSuche im Browser: ${browserUrl}\n\n${shown.map(formatItem).join("\n\n")}` }];
+  return [{ type: "text", text: `${note}${head}\nSuche im Browser: ${browserUrl}\n\n${shown.map(formatItem).join("\n\n")}` }];
 }
 
 function parseItemRef(input: string, country?: string): { host: string; id: string } {
@@ -236,10 +252,11 @@ function toBase64(buf: Uint8Array): string {
 
 async function getItem(input: string, country: string | undefined, withImages: boolean): Promise<Content[]> {
   const { host, id } = parseItemRef(input, country);
-  const details = await fromPage(host, id);
+  const { value: details, staleMinutes } = await cached(`i:${host}:${id}`, ITEM_FRESH_MS, () => fromPage(host, id));
   if (!details) return [{ type: "text", text: `Artikel ${id} auf ${host} nicht gefunden (gelöscht oder verkauft?).` }];
 
-  const content: Content[] = [{ type: "text", text: details.lines.filter((l) => l.trim()).join("\n") }];
+  const text = staleNote(staleMinutes) + details.lines.filter((l) => l.trim()).join("\n");
+  const content: Content[] = [{ type: "text", text }];
   if (withImages) {
     for (const src of details.photos.slice(0, MAX_IMAGES)) {
       const img = await fetch(src, { headers: { "User-Agent": UA } });
@@ -305,11 +322,14 @@ const TOOLS: ToolInfo[] = [
 ];
 
 export const vintedServer: McpServer = {
-  info: { name: "vinted", title: "Vinted", version: "0.2.0" },
+  info: { name: "vinted", title: "Vinted", version: "0.3.0" },
   instructions:
     "Lesender Zugriff auf Vinted ohne Login, Standard ist vinted.de. search_items für Suchen (Preisgrenzen, Zustand, " +
     "Sortierung), get_item für Details und Fotos eines Artikels. Immer den Link zum Artikel mitgeben. " +
-    "Kaufen, Favorisieren und Nachrichten an Verkäufer kann dieser Connector nicht.",
+    "Kaufen, Favorisieren und Nachrichten an Verkäufer kann dieser Connector nicht. " +
+    "Vinted drosselt schnell (HTTP 429): lieber eine Suche mit großem per_page als mehrere Seiten, get_item nur für die " +
+    "zwei, drei Artikel, die wirklich interessieren, und nie mehrere Aufrufe parallel. Nach einer Drosselung nicht sofort " +
+    "erneut versuchen, sondern dem Nutzer Bescheid geben. Ergebnisse werden 15 Minuten (Suche) bzw. 1 Stunde (Artikel) zwischengespeichert.",
   tools: TOOLS,
   async call(name, args) {
     try {

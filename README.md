@@ -50,9 +50,16 @@ Der Workflow prüft das Token vor dem Deploy und schreibt ins Log, was nicht sti
 
 ## Grenzen
 
-Vinted sitzt hinter einem Bot-Schutz (Datadome) und sperrt Rechenzentrums-IPs teils hart. Ob Anfragen aus Cloudflare durchkommen, schwankt; bei einer Sperre meldet der Connector „Vinted blockiert die Anfrage“ oder „keine Sitzung ausgegeben“ statt leerer Ergebnisse. Die Nutzungsbedingungen von Vinted untersagen automatisierte Abfragen, also nur für gelegentliche private Suchen nutzen.
+Vinted drosselt schnell (HTTP 429), vor allem bei vielen Abfragen kurz hintereinander, und Cloudflares Ausgangs-IPs teilen sich viele Nutzer. Der Connector hält die Zahl der Anfragen deshalb klein:
 
-Die API ist inoffiziell. Ändert Vinted Feldnamen, fehlen zuerst einzelne Angaben (Bewertung, Ort), die Suche selbst ist am stabilsten.
+- Suchergebnisse liegen 15 Minuten, Artikel eine Stunde im KV-Speicher `vinted-cache`. Dieselbe Suche mit anderem `per_page` kostet keine neue Anfrage.
+- Bei einer Drosselung liefert er den letzten gespeicherten Stand (bis 24 Stunden alt), mit Hinweis auf das Alter. Gibt es keinen, meldet er die Drosselung, statt es weiter zu versuchen.
+- Ein kurzes `Retry-After` (bis 3 Sekunden) wartet er einmal ab.
+- Claude bekommt die Anweisung, große Seiten statt vieler kleiner abzufragen, `get_item` sparsam zu nutzen und nichts parallel zu schicken.
+
+Umgangen wird der Bot-Schutz nicht, also keine wechselnden IPs, Proxys oder Browser-Imitation. Die Nutzungsbedingungen von Vinted untersagen automatisierte Abfragen. Gedacht ist der Connector für gelegentliche private Suchen, nicht als Dauer-Suchbot.
+
+Die Seiten werden per HTML geparst. Baut Vinted das Layout um, fehlen zuerst Marke und Zustand, im schlimmsten Fall kommen keine Treffer mehr.
 
 ## Lokal entwickeln
 
